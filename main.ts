@@ -10,6 +10,8 @@ import {
   TFile,
 } from "obsidian";
 import * as path from "path";
+// @ts-ignore
+import fixWebmDuration from "fix-webm-duration";
 
 interface AudioRecorderSettings {
   recordingsFolder: string;
@@ -40,7 +42,9 @@ export default class AudioRecorderPlugin extends Plugin {
   controlWindow: any = null; // BrowserWindow
   processorNode: ScriptProcessorNode | null = null;
   muteGainNode: GainNode | null = null;
+  animationIntervalId: NodeJS.Timeout | null = null;
   electron: any = null; // Electron reference
+  startTime: number = 0;
 
   async onload() {
     await this.loadSettings();
@@ -261,6 +265,7 @@ export default class AudioRecorderPlugin extends Plugin {
       };
 
       this.recorder.start();
+      this.startTime = Date.now();
       this.statusBarItem?.setText("Recording...");
       new Notice("Recording started.");
 
@@ -488,7 +493,15 @@ export default class AudioRecorderPlugin extends Plugin {
   }
 
   async saveRecording(blob: Blob) {
-    const arrayBuffer = await blob.arrayBuffer();
+    const duration = Date.now() - this.startTime;
+
+    const fixedBlob = await new Promise<Blob>((resolve) => {
+      fixWebmDuration(blob, duration, (fixed: Blob) => {
+        resolve(fixed);
+      });
+    });
+
+    const arrayBuffer = await fixedBlob.arrayBuffer();
     const buffer = new Uint8Array(arrayBuffer);
 
     // Ensure folder exists
