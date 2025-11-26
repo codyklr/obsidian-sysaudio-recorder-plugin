@@ -13,6 +13,9 @@ Record system and microphone audio directly in Obsidian with an elegant, always-
 - Live waveform visualization provide a representation of real-time audio levels
 - One-click mute/unmute button for your microphone
 - Automatically matches your Obsidian accent color
+ <img width="450" height="250" alt="control_window" src="https://github.com/user-attachments/assets/f130a32a-8766-4258-9159-f9657f91c99b" />
+
+
 
 ### Global  Hotkey Support
 - Set a system-wide hotkey to toggle microphone mute (default: `Ctrl+Shift+M`)
