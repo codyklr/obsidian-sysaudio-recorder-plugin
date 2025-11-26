@@ -8,13 +8,11 @@
             margin: 0;
             padding: 0;
             background: transparent !important;
-            /* Critical for transparency */
             height: 100%;
             overflow: hidden;
             font-family: sans-serif;
         }
 
-        /* The actual visible window container */
         .container {
             background-color: rgba(0, 0, 0, 0.85);
             color: white;
@@ -22,19 +20,15 @@
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            /* Center content vertically */
             gap: 10px;
-            /* Space between rows */
             height: 100%;
             border-radius: 30px;
             border: 1px solid rgba(255, 255, 255, 0.1);
             box-sizing: border-box;
             padding: 15px 20px;
-            /* Reduced vertical padding */
             -webkit-app-region: drag;
         }
 
-        /* Top Row: Logo, Waveform, Mic */
         .top-row {
             display: flex;
             align-items: center;
@@ -131,7 +125,6 @@
             height: 28px;
         }
 
-        /* Muted state */
         .mic-btn.muted {
             color: #ef4444;
         }
@@ -232,7 +225,6 @@
 
             <button class="mic-btn" id="micBtn" title="Toggle Microphone">
                 <div class="mic-icon">
-                    <!-- Mic Icon -->
                     <svg viewBox="0 0 1024 1024" class="icon" xmlns="http://www.w3.org/2000/svg">
                         <path fill="currentColor"
                             d="M512 128a128 128 0 00-128 128v256a128 128 0 10256 0V256a128 128 0 00-128-128zm0-64a192 192 0 01192 192v256a192 192 0 11-384 0V256A192 192 0 01512 64zm-32 832v-64a288 288 0 01-288-288v-32a32 32 0 0164 0v32a224 224 0 00224 224h64a224 224 0 00224-224v-32a32 32 0 1164 0v32a288 288 0 01-288 288v64h64a32 32 0 110 64H416a32 32 0 110-64h64z" />
