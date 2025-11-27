@@ -24,7 +24,7 @@ Record system and microphone audio directly in Obsidian with an elegant, always-
 
 ### Seamless Note Integration
 - Recordings automatically embed into the note that was active when the recording was started
-- Saved as WebM audio files
+- Saved as WebM or WAV audio files
 - Customizable recordings folder
 
 # How to use
@@ -40,6 +40,7 @@ Record system and microphone audio directly in Obsidian with an elegant, always-
 | Recordings Folder  | Where to save your audio files                                           |
 | Record Microphone  | Toggle microphone to be completely on/off (on by default)                |
 | Microphone Source  | Select which microphone to use (will default to your system default mic) |
+| Output Format      | Select the output format (WebM or WAV)                                   |  
 | Global Mute Hotkey | System-wide shortcut for muting (e.g., `CommandOrControl+Shift+M`)       |
 
 # Requirements
