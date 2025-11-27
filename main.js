@@ -534,8 +534,9 @@ var DEFAULT_SETTINGS = {
   recordingsFolder: "Recordings",
   recordMicrophone: true,
   selectedMicrophoneId: "default",
-  muteHotkey: "CommandOrControl+Shift+M"
+  muteHotkey: "CommandOrControl+Shift+M",
   // Default global hotkey
+  outputFormat: "webm"
 };
 var AudioRecorderPlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -558,6 +559,11 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
     this.electron = null;
     // Electron reference
     this.startTime = 0;
+    // WAV Recording Properties
+    this.recordingProcessor = null;
+    this.wavChunks = [];
+    this.sampleRate = 44100;
+    this.numChannels = 2;
   }
   async onload() {
     await this.loadSettings();
@@ -594,12 +600,15 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
   async toggleRecording() {
     if (this.recorder && this.recorder.state === "recording") {
       this.stopRecording();
+    } else if (this.recordingProcessor) {
+      this.stopRecording();
     } else {
       this.startRecording();
     }
   }
   toggleMute() {
-    if (!this.recorder || this.recorder.state !== "recording") {
+    const isRecording = this.recorder && this.recorder.state === "recording" || this.recordingProcessor;
+    if (!isRecording) {
       new import_obsidian.Notice("No active recording to mute/unmute microphone.");
       return;
     }
@@ -675,6 +684,7 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
       }
       let finalStream;
       this.audioContext = new AudioContext();
+      this.sampleRate = this.audioContext.sampleRate;
       const destination = this.audioContext.createMediaStreamDestination();
       const masterGain = this.audioContext.createGain();
       masterGain.connect(destination);
@@ -701,25 +711,45 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
         this.stopRecordingStreams();
         return;
       }
-      this.recorder = new MediaRecorder(finalStream, {
-        mimeType: "audio/webm"
-      });
-      this.chunks = [];
-      this.recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          this.chunks.push(e.data);
-        }
-      };
-      this.recorder.onstop = async () => {
-        var _a2;
-        const blob = new Blob(this.chunks, { type: "audio/webm" });
-        await this.saveRecording(blob);
-        this.stopRecordingStreams();
-        (_a2 = this.statusBarItem) == null ? void 0 : _a2.setText("");
-        new import_obsidian.Notice("Recording saved.");
-        this.closeControlWindow();
-      };
-      this.recorder.start();
+      if (this.settings.outputFormat === "webm") {
+        this.recorder = new MediaRecorder(finalStream, {
+          mimeType: "audio/webm"
+        });
+        this.chunks = [];
+        this.recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) {
+            this.chunks.push(e.data);
+          }
+        };
+        this.recorder.onstop = async () => {
+          var _a2;
+          const blob = new Blob(this.chunks, { type: "audio/webm" });
+          await this.saveRecording(blob);
+          this.stopRecordingStreams();
+          (_a2 = this.statusBarItem) == null ? void 0 : _a2.setText("");
+          new import_obsidian.Notice("Recording saved.");
+          this.closeControlWindow();
+        };
+        this.recorder.start();
+      } else {
+        this.recordingProcessor = this.audioContext.createScriptProcessor(4096, 2, 2);
+        this.wavChunks = [];
+        this.recordingProcessor.onaudioprocess = (e) => {
+          if (!this.recordingProcessor)
+            return;
+          const left = e.inputBuffer.getChannelData(0);
+          const right = e.inputBuffer.getChannelData(1);
+          if (this.settings.outputFormat === "wav") {
+            const interleaved = this.interleave(left, right);
+            this.wavChunks.push(interleaved);
+          }
+        };
+        const recordingMuteGain = this.audioContext.createGain();
+        recordingMuteGain.gain.value = 0;
+        masterGain.connect(this.recordingProcessor);
+        this.recordingProcessor.connect(recordingMuteGain);
+        recordingMuteGain.connect(this.audioContext.destination);
+      }
       this.startTime = Date.now();
       (_a = this.statusBarItem) == null ? void 0 : _a.setText("Recording...");
       new import_obsidian.Notice("Recording started.");
@@ -836,9 +866,36 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
       }
     };
   }
-  stopRecording() {
-    if (this.recorder && this.recorder.state === "recording") {
-      this.recorder.stop();
+  async stopRecording() {
+    var _a;
+    if (this.settings.outputFormat === "webm") {
+      if (this.recorder && this.recorder.state === "recording") {
+        this.recorder.stop();
+      }
+    } else {
+      if (this.recordingProcessor) {
+        this.recordingProcessor.disconnect();
+        this.recordingProcessor = null;
+        if (this.settings.outputFormat === "wav") {
+          let totalLength = 0;
+          for (const chunk of this.wavChunks) {
+            totalLength += chunk.length;
+          }
+          const result = new Float32Array(totalLength);
+          let offset = 0;
+          for (const chunk of this.wavChunks) {
+            result.set(chunk, offset);
+            offset += chunk.length;
+          }
+          const view = this.writeWavHeader(result);
+          const blob = new Blob([view], { type: "audio/wav" });
+          await this.saveRecording(blob);
+        }
+        this.stopRecordingStreams();
+        (_a = this.statusBarItem) == null ? void 0 : _a.setText("");
+        new import_obsidian.Notice("Recording saved.");
+        this.closeControlWindow();
+      }
     }
     this.unregisterGlobalHotkey();
   }
@@ -859,11 +916,16 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
       this.muteGainNode.disconnect();
       this.muteGainNode = null;
     }
+    if (this.recordingProcessor) {
+      this.recordingProcessor.disconnect();
+      this.recordingProcessor = null;
+    }
     if (this.audioContext) {
       this.audioContext.close();
       this.audioContext = null;
     }
     this.recorder = null;
+    this.wavChunks = [];
   }
   registerGlobalHotkey() {
     if (!this.electron || !this.settings.muteHotkey)
@@ -901,22 +963,29 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
     }
   }
   async saveRecording(blob) {
-    const duration = Date.now() - this.startTime;
-    const fixedBlob = await new Promise((resolve) => {
-      (0, import_fix_webm_duration.default)(blob, duration, (fixed) => {
-        resolve(fixed);
+    let buffer;
+    if (this.settings.outputFormat === "webm") {
+      const duration = Date.now() - this.startTime;
+      const fixedBlob = await new Promise((resolve) => {
+        (0, import_fix_webm_duration.default)(blob, duration, (fixed) => {
+          resolve(fixed);
+        });
       });
-    });
-    const arrayBuffer = await fixedBlob.arrayBuffer();
-    const buffer = new Uint8Array(arrayBuffer);
+      const arrayBuffer = await fixedBlob.arrayBuffer();
+      buffer = new Uint8Array(arrayBuffer);
+    } else {
+      const arrayBuffer = await blob.arrayBuffer();
+      buffer = new Uint8Array(arrayBuffer);
+    }
     const folderPath = this.settings.recordingsFolder;
     if (!await this.app.vault.adapter.exists(folderPath)) {
       await this.app.vault.createFolder(folderPath);
     }
     const now = new Date();
     const timestamp = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, "0")}-${now.getDate().toString().padStart(2, "0")} ${now.getHours().toString().padStart(2, "0")}.${now.getMinutes().toString().padStart(2, "0")}.${now.getSeconds().toString().padStart(2, "0")}`;
-    const filename = `${folderPath}/Recording ${timestamp}.webm`;
-    const file = await this.app.vault.createBinary(filename, buffer);
+    const extension = this.settings.outputFormat;
+    const filename = `${folderPath}/Recording ${timestamp}.${extension}`;
+    const file = await this.app.vault.createBinary(filename, buffer.buffer);
     if (this.activeFileAtStart) {
       const linkText = `
 ![[${file.path}]]
@@ -929,6 +998,55 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  interleave(leftChannel, rightChannel) {
+    const length = leftChannel.length + rightChannel.length;
+    const result = new Float32Array(length);
+    let inputIndex = 0;
+    for (let index = 0; index < length; ) {
+      result[index++] = leftChannel[inputIndex];
+      result[index++] = rightChannel[inputIndex];
+      inputIndex++;
+    }
+    return result;
+  }
+  convertFloat32ToInt16(buffer) {
+    let l = buffer.length;
+    const buf = new Int16Array(l);
+    while (l--) {
+      buf[l] = Math.min(1, Math.max(-1, buffer[l])) * 32767;
+    }
+    return buf;
+  }
+  writeWavHeader(samples) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    this.writeString(view, 0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    this.writeString(view, 8, "WAVE");
+    this.writeString(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, this.numChannels, true);
+    view.setUint32(24, this.sampleRate, true);
+    view.setUint32(28, this.sampleRate * 4, true);
+    view.setUint16(32, this.numChannels * 2, true);
+    view.setUint16(34, 16, true);
+    this.writeString(view, 36, "data");
+    view.setUint32(40, samples.length * 2, true);
+    this.floatTo16BitPCM(view, 44, samples);
+    return view;
+  }
+  floatTo16BitPCM(output, offset, input) {
+    for (let i = 0; i < input.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      output.setInt16(offset, s < 0 ? s * 32768 : s * 32767, true);
+    }
+  }
+  writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
   }
 };
 var AudioRecorderSettingTab = class extends import_obsidian.PluginSettingTab {
@@ -964,6 +1082,12 @@ var AudioRecorderSettingTab = class extends import_obsidian.PluginSettingTab {
       dropdown.setValue(this.plugin.settings.selectedMicrophoneId);
       dropdown.onChange(async (value) => {
         this.plugin.settings.selectedMicrophoneId = value;
+        await this.plugin.saveSettings();
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName("Output Format").setDesc("Select the audio output format.").addDropdown((dropdown) => {
+      dropdown.addOption("webm", "WebM").addOption("wav", "WAV").setValue(this.plugin.settings.outputFormat).onChange(async (value) => {
+        this.plugin.settings.outputFormat = value;
         await this.plugin.saveSettings();
       });
     });
