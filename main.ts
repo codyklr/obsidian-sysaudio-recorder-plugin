@@ -18,6 +18,7 @@ interface AudioRecorderSettings {
   recordMicrophone: boolean;
   selectedMicrophoneId: string;
   muteHotkey: string; // Global hotkey for mute toggle
+  outputFormat: "webm" | "wav";
 }
 
 const DEFAULT_SETTINGS: AudioRecorderSettings = {
@@ -25,6 +26,7 @@ const DEFAULT_SETTINGS: AudioRecorderSettings = {
   recordMicrophone: true,
   selectedMicrophoneId: "default",
   muteHotkey: "CommandOrControl+Shift+M", // Default global hotkey
+  outputFormat: "webm",
 };
 
 export default class AudioRecorderPlugin extends Plugin {
@@ -45,6 +47,12 @@ export default class AudioRecorderPlugin extends Plugin {
   animationIntervalId: NodeJS.Timeout | null = null;
   electron: any = null; // Electron reference
   startTime: number = 0;
+
+  // WAV Recording Properties
+  recordingProcessor: ScriptProcessorNode | null = null;
+  wavChunks: Float32Array[] = [];
+  sampleRate: number = 44100;
+  numChannels: number = 2;
 
   async onload() {
     await this.loadSettings();
@@ -93,6 +101,8 @@ export default class AudioRecorderPlugin extends Plugin {
   async toggleRecording() {
     if (this.recorder && this.recorder.state === "recording") {
       this.stopRecording();
+    } else if (this.recordingProcessor) {
+      this.stopRecording();
     } else {
       this.startRecording();
     }
@@ -100,7 +110,9 @@ export default class AudioRecorderPlugin extends Plugin {
 
   toggleMute() {
     // Only allow muting during active recording
-    if (!this.recorder || this.recorder.state !== "recording") {
+    const isRecording = (this.recorder && this.recorder.state === "recording") || this.recordingProcessor;
+
+    if (!isRecording) {
       new Notice("No active recording to mute/unmute microphone.");
       return;
     }
@@ -206,6 +218,7 @@ export default class AudioRecorderPlugin extends Plugin {
       // 3. Mix Streams & Setup Audio Context
       let finalStream: MediaStream;
       this.audioContext = new AudioContext();
+      this.sampleRate = this.audioContext.sampleRate; // Capture actual sample rate
       const destination = this.audioContext.createMediaStreamDestination();
 
       // Create a Master Gain Node to mix everything before sending to destination/analyser
@@ -244,27 +257,55 @@ export default class AudioRecorderPlugin extends Plugin {
         return;
       }
 
-      this.recorder = new MediaRecorder(finalStream, {
-        mimeType: "audio/webm",
-      });
-      this.chunks = [];
+      // Initialize recording based on format
+      if (this.settings.outputFormat === "webm") {
+        this.recorder = new MediaRecorder(finalStream, {
+          mimeType: "audio/webm",
+        });
+        this.chunks = [];
 
-      this.recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          this.chunks.push(e.data);
-        }
-      };
+        this.recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) {
+            this.chunks.push(e.data);
+          }
+        };
 
-      this.recorder.onstop = async () => {
-        const blob = new Blob(this.chunks, { type: "audio/webm" });
-        await this.saveRecording(blob);
-        this.stopRecordingStreams();
-        this.statusBarItem?.setText("");
-        new Notice("Recording saved.");
-        this.closeControlWindow();
-      };
+        this.recorder.onstop = async () => {
+          const blob = new Blob(this.chunks, { type: "audio/webm" });
+          await this.saveRecording(blob);
+          this.stopRecordingStreams();
+          this.statusBarItem?.setText("");
+          new Notice("Recording saved.");
+          this.closeControlWindow();
+        };
 
-      this.recorder.start();
+        this.recorder.start();
+      } else {
+        // WAV recording using ScriptProcessorNode
+        // We need to capture raw audio data
+        this.recordingProcessor = this.audioContext.createScriptProcessor(4096, 2, 2);
+        this.wavChunks = [];
+
+        this.recordingProcessor.onaudioprocess = (e) => {
+          if (!this.recordingProcessor) return;
+
+          const left = e.inputBuffer.getChannelData(0);
+          const right = e.inputBuffer.getChannelData(1);
+
+          if (this.settings.outputFormat === "wav") {
+            const interleaved = this.interleave(left, right);
+            this.wavChunks.push(interleaved);
+          }
+        };
+
+        const recordingMuteGain = this.audioContext.createGain();
+        recordingMuteGain.gain.value = 0;
+
+        masterGain.connect(this.recordingProcessor);
+        this.recordingProcessor.connect(recordingMuteGain);
+        recordingMuteGain.connect(this.audioContext.destination);
+      }
+
       this.startTime = Date.now();
       this.statusBarItem?.setText("Recording...");
       new Notice("Recording started.");
@@ -372,13 +413,8 @@ export default class AudioRecorderPlugin extends Plugin {
 
     const dataArray = new Uint8Array(this.analyserNode.frequencyBinCount);
 
-    // Use ScriptProcessorNode as a timer that doesn't get throttled by the browser
-    // when the window is minimized/backgrounded.
-    // Buffer size 2048 gives ~21-23fps (44100/2048), which is sufficient for this visualization
-    // and low enough overhead.
     this.processorNode = this.audioContext.createScriptProcessor(2048, 1, 1);
 
-    // We need to connect it to destination for it to run, but we don't want to hear it
     this.muteGainNode = this.audioContext.createGain();
     this.muteGainNode.gain.value = 0;
 
@@ -397,14 +433,12 @@ export default class AudioRecorderPlugin extends Plugin {
 
       this.analyserNode.getByteFrequencyData(dataArray);
 
-      // Calculate average volume level (0.0 to 1.0)
       let sum = 0;
       for (let i = 0; i < dataArray.length; i++) {
         sum += dataArray[i];
       }
       const average = sum / dataArray.length / 255;
 
-      // Send to window
       try {
         if (!this.controlWindow.isDestroyed()) {
           this.controlWindow.webContents.send("audio-level", average);
@@ -415,9 +449,41 @@ export default class AudioRecorderPlugin extends Plugin {
     };
   }
 
-  stopRecording() {
-    if (this.recorder && this.recorder.state === "recording") {
-      this.recorder.stop();
+  async stopRecording() {
+    if (this.settings.outputFormat === "webm") {
+      if (this.recorder && this.recorder.state === "recording") {
+        this.recorder.stop();
+      }
+    } else {
+      // Stop WAV recording
+      if (this.recordingProcessor) {
+        this.recordingProcessor.disconnect();
+        this.recordingProcessor = null;
+
+        if (this.settings.outputFormat === "wav") {
+          let totalLength = 0;
+          for (const chunk of this.wavChunks) {
+            totalLength += chunk.length;
+          }
+
+          const result = new Float32Array(totalLength);
+          let offset = 0;
+          for (const chunk of this.wavChunks) {
+            result.set(chunk, offset);
+            offset += chunk.length;
+          }
+
+          const view = this.writeWavHeader(result);
+          const blob = new Blob([view], { type: "audio/wav" });
+          await this.saveRecording(blob);
+
+        }
+
+        this.stopRecordingStreams();
+        this.statusBarItem?.setText("");
+        new Notice("Recording saved.");
+        this.closeControlWindow();
+      }
     }
     this.unregisterGlobalHotkey();
   }
@@ -442,11 +508,17 @@ export default class AudioRecorderPlugin extends Plugin {
       this.muteGainNode = null;
     }
 
+    if (this.recordingProcessor) {
+      this.recordingProcessor.disconnect();
+      this.recordingProcessor = null;
+    }
+
     if (this.audioContext) {
       this.audioContext.close();
       this.audioContext = null;
     }
     this.recorder = null;
+    this.wavChunks = [];
   }
 
   registerGlobalHotkey() {
@@ -456,10 +528,8 @@ export default class AudioRecorderPlugin extends Plugin {
       const remote = this.electron.remote || this.electron;
       const { globalShortcut } = remote;
 
-      // Unregister any existing hotkey first
       this.unregisterGlobalHotkey();
 
-      // Register the new hotkey
       const registered = globalShortcut.register(
         this.settings.muteHotkey,
         () => {
@@ -493,32 +563,35 @@ export default class AudioRecorderPlugin extends Plugin {
   }
 
   async saveRecording(blob: Blob) {
-    const duration = Date.now() - this.startTime;
+    let buffer: Uint8Array;
 
-    const fixedBlob = await new Promise<Blob>((resolve) => {
-      fixWebmDuration(blob, duration, (fixed: Blob) => {
-        resolve(fixed);
+    if (this.settings.outputFormat === "webm") {
+      const duration = Date.now() - this.startTime;
+      const fixedBlob = await new Promise<Blob>((resolve) => {
+        fixWebmDuration(blob, duration, (fixed: Blob) => {
+          resolve(fixed);
+        });
       });
-    });
+      const arrayBuffer = await fixedBlob.arrayBuffer();
+      buffer = new Uint8Array(arrayBuffer);
+    } else {
+      const arrayBuffer = await blob.arrayBuffer();
+      buffer = new Uint8Array(arrayBuffer);
+    }
 
-    const arrayBuffer = await fixedBlob.arrayBuffer();
-    const buffer = new Uint8Array(arrayBuffer);
-
-    // Ensure folder exists
     const folderPath = this.settings.recordingsFolder;
     if (!(await this.app.vault.adapter.exists(folderPath))) {
       await this.app.vault.createFolder(folderPath);
     }
 
-    // Generate filename
     const now = new Date();
     const timestamp = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, "0")}-${now.getDate().toString().padStart(2, "0")} ${now.getHours().toString().padStart(2, "0")}.${now.getMinutes().toString().padStart(2, "0")}.${now.getSeconds().toString().padStart(2, "0")}`;
-    const filename = `${folderPath}/Recording ${timestamp}.webm`;
+    const extension = this.settings.outputFormat;
+    const filename = `${folderPath}/Recording ${timestamp}.${extension}`;
 
-    // Save file
-    const file = await this.app.vault.createBinary(filename, buffer);
+    // @ts-ignore
+    const file = await this.app.vault.createBinary(filename, buffer.buffer);
 
-    // Insert link if applicable
     if (this.activeFileAtStart) {
       const linkText = `\n![[${file.path}]]\n`;
       await this.app.vault.append(this.activeFileAtStart, linkText);
@@ -531,6 +604,65 @@ export default class AudioRecorderPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  interleave(leftChannel: Float32Array, rightChannel: Float32Array) {
+    const length = leftChannel.length + rightChannel.length;
+    const result = new Float32Array(length);
+
+    let inputIndex = 0;
+
+    for (let index = 0; index < length;) {
+      result[index++] = leftChannel[inputIndex];
+      result[index++] = rightChannel[inputIndex];
+      inputIndex++;
+    }
+    return result;
+  }
+
+  convertFloat32ToInt16(buffer: Float32Array) {
+    let l = buffer.length;
+    const buf = new Int16Array(l);
+    while (l--) {
+      buf[l] = Math.min(1, Math.max(-1, buffer[l])) * 0x7fff;
+    }
+    return buf;
+  }
+
+  writeWavHeader(samples: Float32Array) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    this.writeString(view, 0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    this.writeString(view, 8, "WAVE");
+    this.writeString(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, this.numChannels, true);
+    view.setUint32(24, this.sampleRate, true);
+    view.setUint32(28, this.sampleRate * 4, true);
+    view.setUint16(32, this.numChannels * 2, true);
+    view.setUint16(34, 16, true);
+    this.writeString(view, 36, "data");
+    view.setUint32(40, samples.length * 2, true);
+
+    this.floatTo16BitPCM(view, 44, samples);
+
+    return view;
+  }
+
+  floatTo16BitPCM(output: DataView, offset: number, input: Float32Array) {
+    for (let i = 0; i < input.length; i++, offset += 2) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+  }
+
+  writeString(view: DataView, offset: number, string: string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
   }
 }
 
@@ -593,6 +725,20 @@ class AudioRecorderSettingTab extends PluginSettingTab {
           this.plugin.settings.selectedMicrophoneId = value;
           await this.plugin.saveSettings();
         });
+      });
+
+    new Setting(containerEl)
+      .setName("Output Format")
+      .setDesc("Select the audio output format.")
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("webm", "WebM")
+          .addOption("wav", "WAV")
+          .setValue(this.plugin.settings.outputFormat)
+          .onChange(async (value: "webm" | "wav") => {
+            this.plugin.settings.outputFormat = value;
+            await this.plugin.saveSettings();
+          });
       });
 
     // Hotkeys Section
