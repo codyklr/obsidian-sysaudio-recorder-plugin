@@ -48,9 +48,7 @@ export default class AudioRecorderPlugin extends Plugin {
   electron: any = null; // Electron reference
   startTime: number = 0;
 
-  // WAV Recording Properties
-  recordingProcessor: ScriptProcessorNode | null = null;
-  wavChunks: Float32Array[] = [];
+  // Audio properties
   sampleRate: number = 44100;
   numChannels: number = 2;
 
@@ -101,8 +99,6 @@ export default class AudioRecorderPlugin extends Plugin {
   async toggleRecording() {
     if (this.recorder && this.recorder.state === "recording") {
       this.stopRecording();
-    } else if (this.recordingProcessor) {
-      this.stopRecording();
     } else {
       this.startRecording();
     }
@@ -110,7 +106,7 @@ export default class AudioRecorderPlugin extends Plugin {
 
   toggleMute() {
     // Only allow muting during active recording
-    const isRecording = (this.recorder && this.recorder.state === "recording") || this.recordingProcessor;
+    const isRecording = this.recorder && this.recorder.state === "recording";
 
     if (!isRecording) {
       new Notice("No active recording to mute/unmute microphone.");
@@ -257,54 +253,40 @@ export default class AudioRecorderPlugin extends Plugin {
         return;
       }
 
-      // Initialize recording based on format
-      if (this.settings.outputFormat === "webm") {
-        this.recorder = new MediaRecorder(finalStream, {
-          mimeType: "audio/webm",
-        });
-        this.chunks = [];
+      // Always use MediaRecorder (WebM) for recording
+      // If WAV is selected, we'll convert it after recording stops
+      this.recorder = new MediaRecorder(finalStream, {
+        mimeType: "audio/webm",
+      });
+      this.chunks = [];
 
-        this.recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) {
-            this.chunks.push(e.data);
-          }
-        };
+      this.recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          this.chunks.push(e.data);
+        }
+      };
 
-        this.recorder.onstop = async () => {
-          const blob = new Blob(this.chunks, { type: "audio/webm" });
-          await this.saveRecording(blob);
-          this.stopRecordingStreams();
-          this.statusBarItem?.setText("");
-          new Notice("Recording saved.");
-          this.closeControlWindow();
-        };
+      this.recorder.onstop = async () => {
+        const webmBlob = new Blob(this.chunks, { type: "audio/webm" });
 
-        this.recorder.start();
-      } else {
-        // WAV recording using ScriptProcessorNode
-        // We need to capture raw audio data
-        this.recordingProcessor = this.audioContext.createScriptProcessor(4096, 2, 2);
-        this.wavChunks = [];
+        let finalBlob: Blob;
+        if (this.settings.outputFormat === "wav") {
+          // Convert WebM to WAV
+          new Notice("Converting to WAV...");
+          finalBlob = await this.convertWebMToWAV(webmBlob);
+        } else {
+          // Keep as WebM
+          finalBlob = webmBlob;
+        }
 
-        this.recordingProcessor.onaudioprocess = (e) => {
-          if (!this.recordingProcessor) return;
+        await this.saveRecording(finalBlob);
+        this.stopRecordingStreams();
+        this.statusBarItem?.setText("");
+        new Notice("Recording saved.");
+        this.closeControlWindow();
+      };
 
-          const left = e.inputBuffer.getChannelData(0);
-          const right = e.inputBuffer.getChannelData(1);
-
-          if (this.settings.outputFormat === "wav") {
-            const interleaved = this.interleave(left, right);
-            this.wavChunks.push(interleaved);
-          }
-        };
-
-        const recordingMuteGain = this.audioContext.createGain();
-        recordingMuteGain.gain.value = 0;
-
-        masterGain.connect(this.recordingProcessor);
-        this.recordingProcessor.connect(recordingMuteGain);
-        recordingMuteGain.connect(this.audioContext.destination);
-      }
+      this.recorder.start();
 
       this.startTime = Date.now();
       this.statusBarItem?.setText("Recording...");
@@ -450,42 +432,50 @@ export default class AudioRecorderPlugin extends Plugin {
   }
 
   async stopRecording() {
-    if (this.settings.outputFormat === "webm") {
-      if (this.recorder && this.recorder.state === "recording") {
-        this.recorder.stop();
-      }
-    } else {
-      // Stop WAV recording
-      if (this.recordingProcessor) {
-        this.recordingProcessor.disconnect();
-        this.recordingProcessor = null;
-
-        if (this.settings.outputFormat === "wav") {
-          let totalLength = 0;
-          for (const chunk of this.wavChunks) {
-            totalLength += chunk.length;
-          }
-
-          const result = new Float32Array(totalLength);
-          let offset = 0;
-          for (const chunk of this.wavChunks) {
-            result.set(chunk, offset);
-            offset += chunk.length;
-          }
-
-          const view = this.writeWavHeader(result);
-          const blob = new Blob([view], { type: "audio/wav" });
-          await this.saveRecording(blob);
-
-        }
-
-        this.stopRecordingStreams();
-        this.statusBarItem?.setText("");
-        new Notice("Recording saved.");
-        this.closeControlWindow();
-      }
+    if (this.recorder && this.recorder.state === "recording") {
+      this.recorder.stop();
     }
     this.unregisterGlobalHotkey();
+  }
+
+  async convertWebMToWAV(webmBlob: Blob): Promise<Blob> {
+    // Decode WebM to raw audio data
+    const arrayBuffer = await webmBlob.arrayBuffer();
+    const audioBuffer = await this.audioContext!.decodeAudioData(arrayBuffer);
+
+    // Update sample rate from decoded audio
+    this.sampleRate = audioBuffer.sampleRate;
+    this.numChannels = audioBuffer.numberOfChannels;
+
+    // Extract channel data
+    const channels: Float32Array[] = [];
+    for (let i = 0; i < this.numChannels; i++) {
+      channels.push(audioBuffer.getChannelData(i));
+    }
+
+    // Interleave channels
+    let interleaved: Float32Array;
+    if (this.numChannels === 2) {
+      interleaved = this.interleave(channels[0], channels[1]);
+    } else if (this.numChannels === 1) {
+      // Mono - duplicate to stereo for consistency
+      interleaved = this.interleave(channels[0], channels[0]);
+      this.numChannels = 2;
+    } else {
+      // More than 2 channels - mix down to stereo
+      const left = new Float32Array(audioBuffer.length);
+      const right = new Float32Array(audioBuffer.length);
+      for (let i = 0; i < audioBuffer.length; i++) {
+        left[i] = channels[0][i];
+        right[i] = channels[Math.min(1, channels.length - 1)][i];
+      }
+      interleaved = this.interleave(left, right);
+      this.numChannels = 2;
+    }
+
+    // Create WAV file
+    const wavData = this.writeWavHeader(interleaved);
+    return new Blob([wavData], { type: "audio/wav" });
   }
 
   stopRecordingStreams() {
@@ -508,17 +498,11 @@ export default class AudioRecorderPlugin extends Plugin {
       this.muteGainNode = null;
     }
 
-    if (this.recordingProcessor) {
-      this.recordingProcessor.disconnect();
-      this.recordingProcessor = null;
-    }
-
     if (this.audioContext) {
       this.audioContext.close();
       this.audioContext = null;
     }
     this.recorder = null;
-    this.wavChunks = [];
   }
 
   registerGlobalHotkey() {
