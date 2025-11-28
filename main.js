@@ -536,7 +536,12 @@ var DEFAULT_SETTINGS = {
   selectedMicrophoneId: "default",
   muteHotkey: "CommandOrControl+Shift+M",
   // Default global hotkey
-  outputFormat: "webm"
+  outputFormat: "webm",
+  enableTranscription: false,
+  transcriptionMethod: "local",
+  whisperModel: "base.en",
+  whisperApiKey: "",
+  whisperCppPath: ""
 };
 var AudioRecorderPlugin = class extends import_obsidian.Plugin {
   constructor() {
@@ -562,7 +567,18 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
     // Audio properties
     this.sampleRate = 44100;
     this.numChannels = 2;
+    // Transcription properties
+    this.isTranscribing = false;
+    this.transcriptionProcessor = null;
+    this.transcriptionBuffer = [];
+    this.transcriptionChunkIndex = 0;
+    this.transcriptionText = "";
+    // Accumulated transcription text
+    this.transcriptionQueue = [];
+    this.isProcessingQueue = false;
+    this.lastTranscriptionText = "";
   }
+  // For deduplication
   async onload() {
     await this.loadSettings();
     const ribbonIconEl = this.addRibbonIcon(
@@ -587,6 +603,13 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
       name: "Toggle Microphone Mute",
       callback: () => {
         this.toggleMute();
+      }
+    });
+    this.addCommand({
+      id: "show-control-window",
+      name: "Show Recording Control Window",
+      callback: () => {
+        this.showControlWindow();
       }
     });
     this.addSettingTab(new AudioRecorderSettingTab(this.app, this));
@@ -620,7 +643,6 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice(this.isMicMuted ? "Microphone muted" : "Microphone unmuted");
   }
   async startRecording() {
-    var _a;
     try {
       this.activeFileAtStart = this.app.workspace.getActiveFile();
       const electron = require("electron");
@@ -717,7 +739,6 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
         }
       };
       this.recorder.onstop = async () => {
-        var _a2;
         const webmBlob = new Blob(this.chunks, { type: "audio/webm" });
         let finalBlob;
         if (this.settings.outputFormat === "wav") {
@@ -728,13 +749,13 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
         }
         await this.saveRecording(finalBlob);
         this.stopRecordingStreams();
-        (_a2 = this.statusBarItem) == null ? void 0 : _a2.setText("");
+        this.statusBarItem?.setText("");
         new import_obsidian.Notice("Recording saved.");
         this.closeControlWindow();
       };
       this.recorder.start();
       this.startTime = Date.now();
-      (_a = this.statusBarItem) == null ? void 0 : _a.setText("Recording...");
+      this.statusBarItem?.setText("Recording...");
       new import_obsidian.Notice("Recording started.");
       this.openControlWindow(electron);
       this.startAudioVisualization();
@@ -777,6 +798,9 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
         "--interactive-accent"
       ) || "#7c3aed";
       this.controlWindow.webContents.send("set-accent-color", accentColor);
+      this.controlWindow.webContents.send("transcription-settings", {
+        enabled: this.settings.enableTranscription
+      });
     });
     const onMuteMic = () => {
       if (this.micGainNode) {
@@ -793,15 +817,64 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
     const onStopRecording = () => {
       this.stopRecording();
     };
+    const onToggleTranscription = () => {
+      this.toggleTranscription();
+    };
+    const onResizeControlWindow = (event, width2, height2) => {
+      if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+        const currentBounds = this.controlWindow.getBounds();
+        this.controlWindow.setBounds({
+          x: currentBounds.x,
+          y: currentBounds.y,
+          // Keep Y position fixed
+          width: width2,
+          height: height2
+        });
+      }
+    };
     ipcMain.on("mute-mic", onMuteMic);
     ipcMain.on("unmute-mic", onUnmuteMic);
     ipcMain.on("stop-recording", onStopRecording);
+    ipcMain.on("toggle-transcription", onToggleTranscription);
+    ipcMain.on("resize-control-window", onResizeControlWindow);
+    this.controlWindow.on("blur", () => {
+      if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+        this.controlWindow.setAlwaysOnTop(false);
+        this.controlWindow.setAlwaysOnTop(true);
+      }
+    });
+    this.controlWindow.on("focus", () => {
+      if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+        this.controlWindow.show();
+        this.controlWindow.focus();
+      }
+    });
+    this.controlWindow.on("minimize", (event) => {
+      event.preventDefault();
+      if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+        this.controlWindow.restore();
+        this.controlWindow.focus();
+      }
+    });
     this.controlWindow.on("closed", () => {
       ipcMain.removeListener("mute-mic", onMuteMic);
       ipcMain.removeListener("unmute-mic", onUnmuteMic);
       ipcMain.removeListener("stop-recording", onStopRecording);
+      ipcMain.removeListener("toggle-transcription", onToggleTranscription);
+      ipcMain.removeListener("resize-control-window", onResizeControlWindow);
       this.controlWindow = null;
     });
+  }
+  showControlWindow() {
+    if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+      this.controlWindow.show();
+      this.controlWindow.restore();
+      this.controlWindow.focus();
+      this.controlWindow.setAlwaysOnTop(true);
+      new import_obsidian.Notice("Control window restored.");
+    } else if (!this.recorder || this.recorder.state !== "recording") {
+      new import_obsidian.Notice("No recording in progress.");
+    }
   }
   closeControlWindow() {
     if (this.controlWindow) {
@@ -849,7 +922,341 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
       }
     };
   }
+  toggleTranscription() {
+    if (this.isTranscribing) {
+      this.stopTranscription();
+    } else {
+      this.startTranscription();
+    }
+  }
+  startTranscription() {
+    if (!this.settings.enableTranscription || this.isTranscribing)
+      return;
+    if (!this.recorder || this.recorder.state !== "recording")
+      return;
+    this.isTranscribing = true;
+    this.transcriptionBuffer = [];
+    this.transcriptionChunkIndex = 0;
+    this.transcriptionText = "";
+    this.startLocalTranscription();
+    if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+      this.controlWindow.webContents.send("transcription-started");
+    }
+  }
+  async startLocalTranscription() {
+    if (!this.audioContext)
+      return;
+    this.transcriptionProcessor = this.audioContext.createScriptProcessor(
+      4096,
+      this.numChannels,
+      this.numChannels
+    );
+    if (this.analyserNode) {
+      this.analyserNode.connect(this.transcriptionProcessor);
+    }
+    this.transcriptionProcessor.onaudioprocess = async (event) => {
+      if (!this.isTranscribing)
+        return;
+      const channelData = [];
+      for (let channel = 0; channel < event.inputBuffer.numberOfChannels; channel++) {
+        channelData.push(event.inputBuffer.getChannelData(channel));
+      }
+      const monoData = new Float32Array(channelData[0].length);
+      for (let i = 0; i < monoData.length; i++) {
+        let sum = 0;
+        for (let channel = 0; channel < channelData.length; channel++) {
+          sum += channelData[channel][i];
+        }
+        monoData[i] = sum / channelData.length;
+      }
+      this.transcriptionBuffer.push(monoData);
+      const totalSamples = this.transcriptionBuffer.reduce(
+        (sum, arr) => sum + arr.length,
+        0
+      );
+      const samplesPerChunk = this.sampleRate * 2;
+      if (totalSamples >= samplesPerChunk) {
+        const combined = new Float32Array(totalSamples);
+        let offset = 0;
+        for (const chunk of this.transcriptionBuffer) {
+          combined.set(chunk, offset);
+          offset += chunk.length;
+        }
+        const audioChunk = combined.slice(0, samplesPerChunk);
+        const remaining = combined.slice(samplesPerChunk);
+        this.transcriptionBuffer = remaining.length > 0 ? [remaining] : [];
+        this.queueTranscription(audioChunk);
+      }
+    };
+    const mutedGain = this.audioContext.createGain();
+    mutedGain.gain.value = 0;
+    this.transcriptionProcessor.connect(mutedGain);
+    mutedGain.connect(this.audioContext.destination);
+  }
+  queueTranscription(audioData) {
+    this.transcriptionQueue.push({
+      audioData,
+      timestamp: Date.now()
+    });
+    if (!this.isProcessingQueue) {
+      this.processTranscriptionQueue();
+    }
+  }
+  async processTranscriptionQueue() {
+    if (this.isProcessingQueue)
+      return;
+    this.isProcessingQueue = true;
+    while (this.transcriptionQueue.length > 0) {
+      const item = this.transcriptionQueue.shift();
+      if (item) {
+        try {
+          await this.transcribeAudioChunk(item.audioData);
+        } catch (err) {
+          console.error("Error processing transcription from queue:", err);
+        }
+      }
+    }
+    this.isProcessingQueue = false;
+  }
+  deduplicateTranscription(newText) {
+    if (this.lastTranscriptionText && newText.toLowerCase().trim() === this.lastTranscriptionText.toLowerCase().trim()) {
+      return "";
+    }
+    return newText;
+  }
+  async transcribeAudioChunk(audioData) {
+    try {
+      const fs = require("fs");
+      const path2 = require("path");
+      const os = require("os");
+      const { spawn } = require("child_process");
+      let whisperPath = this.settings.whisperCppPath;
+      if (!whisperPath || !fs.existsSync(whisperPath)) {
+        whisperPath = await this.findWhisperCpp();
+      }
+      if (!whisperPath) {
+        throw new Error(
+          "whisper.cpp not found. Please install it or set the path in settings."
+        );
+      }
+      const pluginDir = path2.join(
+        this.app.vault.adapter.getBasePath(),
+        ".obsidian",
+        "plugins",
+        this.manifest.id
+      );
+      const tempDir = path2.join(pluginDir, "temp");
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+      const chunkFileName = `chunk_${this.transcriptionChunkIndex++}`;
+      const tempWavPath = path2.join(tempDir, `${chunkFileName}.wav`);
+      const wavData = this.createWavFile(audioData, 16e3);
+      fs.writeFileSync(tempWavPath, Buffer.from(wavData.buffer));
+      const modelPath = path2.join(
+        pluginDir,
+        "models",
+        `ggml-${this.settings.whisperModel}.bin`
+      );
+      if (!fs.existsSync(modelPath)) {
+        throw new Error(
+          `Whisper model (${this.settings.whisperModel}) not found. Please download it from the plugin settings (Settings \u2192 Audio Recorder \u2192 Download Model button).`
+        );
+      }
+      const isPythonWhisper = whisperPath.includes("Python") || whisperPath.toLowerCase().includes("scripts");
+      let whisperProcess;
+      let outputTxtPath;
+      let outputBasePath;
+      if (isPythonWhisper) {
+        throw new Error(
+          "Detected OpenAI's Python Whisper. This plugin requires whisper.cpp. Please install whisper.cpp from https://github.com/ggerganov/whisper.cpp/releases"
+        );
+      } else {
+        outputBasePath = path2.join(tempDir, chunkFileName);
+        outputTxtPath = `${outputBasePath}.txt`;
+        const args = [
+          "-m",
+          modelPath,
+          "-f",
+          tempWavPath,
+          "-otxt",
+          "-of",
+          outputBasePath,
+          "--no-timestamps",
+          "-l",
+          "en",
+          "--no-prints",
+          // Reduce output overhead
+          "-t",
+          "6",
+          // Use 6 threads for faster processing
+          "-p",
+          "1"
+          // Processors: 1 for fastest
+        ];
+        whisperProcess = spawn(whisperPath, args);
+      }
+      let stderr = "";
+      let stdout = "";
+      whisperProcess.stderr.on("data", (data) => {
+        const text = data.toString();
+        stderr += text;
+      });
+      whisperProcess.stdout.on("data", (data) => {
+        const text = data.toString();
+        stdout += text;
+      });
+      await new Promise((resolve, reject) => {
+        whisperProcess.on("close", (code) => {
+          if (stdout)
+            console.log("Whisper stdout:", stdout);
+          if (stderr)
+            console.log("Whisper stderr:", stderr);
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(
+              new Error(
+                `Whisper exited with code ${code}. Stderr: ${stderr || "none"}, Stdout: ${stdout || "none"}`
+              )
+            );
+          }
+        });
+        whisperProcess.on("error", (err) => {
+          console.error("Whisper process error:", err);
+          reject(err);
+        });
+      });
+      let actualOutputPath = outputTxtPath;
+      const possiblePaths = [
+        outputTxtPath,
+        `${outputBasePath}.en.txt`
+        // whisper may add .en before .txt
+      ];
+      for (const testPath of possiblePaths) {
+        if (fs.existsSync(testPath)) {
+          actualOutputPath = testPath;
+          break;
+        }
+      }
+      if (fs.existsSync(actualOutputPath)) {
+        let transcriptionText = fs.readFileSync(actualOutputPath, "utf-8").trim();
+        transcriptionText = transcriptionText.replace(/\[BLANK_AUDIO\]/g, "").trim();
+        if (transcriptionText) {
+          const newText = this.deduplicateTranscription(transcriptionText);
+          if (newText) {
+            this.transcriptionText += newText + " ";
+            this.lastTranscriptionText = transcriptionText;
+            if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+              this.controlWindow.webContents.send("transcription-update", {
+                text: this.transcriptionText,
+                // Send accumulated text
+                interim: ""
+              });
+            } else {
+              new import_obsidian.Notice(`Transcription: ${newText}`, 5e3);
+            }
+          }
+        }
+        outputTxtPath = actualOutputPath;
+      } else {
+        console.error(
+          `Output file not found. Checked: ${possiblePaths.join(", ")}`
+        );
+        try {
+          const filesInTemp = fs.readdirSync(tempDir);
+          console.error(`Files in temp dir: ${filesInTemp.join(", ")}`);
+        } catch (e) {
+          console.error(`Could not list temp directory`);
+        }
+      }
+      try {
+        if (fs.existsSync(tempWavPath)) {
+          fs.unlinkSync(tempWavPath);
+        }
+        if (fs.existsSync(outputTxtPath)) {
+          fs.unlinkSync(outputTxtPath);
+        }
+      } catch (err) {
+      }
+    } catch (err) {
+      console.error("Error transcribing audio chunk:", err);
+      if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+        this.controlWindow.webContents.send(
+          "transcription-error",
+          err.message || "Transcription failed"
+        );
+      }
+    }
+  }
+  async findWhisperCpp() {
+    const fs = require("fs");
+    const path2 = require("path");
+    const { spawn } = require("child_process");
+    const os = require("os");
+    const platform = os.platform();
+    const binDir = path2.join(
+      this.app.vault.adapter.getBasePath(),
+      ".obsidian",
+      "plugins",
+      this.manifest.id,
+      "bin"
+    );
+    const localExecutableName = platform === "win32" ? "main.exe" : "main";
+    const localExecutablePath = path2.join(binDir, localExecutableName);
+    if (fs.existsSync(localExecutablePath)) {
+      return localExecutablePath;
+    }
+    const commands = platform === "win32" ? ["whisper.exe", "main.exe", "whisper-cli.exe"] : ["whisper", "whisper.cpp", "main"];
+    for (const cmd of commands) {
+      try {
+        const which = platform === "win32" ? "where" : "which";
+        const result = await new Promise((resolve, reject) => {
+          const proc = spawn(which, [cmd]);
+          let output = "";
+          proc.stdout.on("data", (data) => {
+            output += data.toString();
+          });
+          proc.on("close", (code) => {
+            if (code === 0 && output.trim()) {
+              resolve(output.trim().split("\n")[0]);
+            } else {
+              reject();
+            }
+          });
+        });
+        return result;
+      } catch (err) {
+      }
+    }
+    return null;
+  }
+  async stopTranscription() {
+    this.isTranscribing = false;
+    if (this.transcriptionProcessor) {
+      this.transcriptionProcessor.disconnect();
+      this.transcriptionProcessor = null;
+    }
+    if (this.transcriptionQueue.length > 0) {
+      new import_obsidian.Notice(
+        `Processing remaining ${this.transcriptionQueue.length} transcription chunks...`
+      );
+      while (this.transcriptionQueue.length > 0 || this.isProcessingQueue) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      new import_obsidian.Notice("All transcription chunks processed!");
+    }
+    this.transcriptionBuffer = [];
+    this.transcriptionQueue = [];
+    this.lastTranscriptionText = "";
+    if (this.controlWindow && !this.controlWindow.isDestroyed()) {
+      this.controlWindow.webContents.send("transcription-stopped");
+    }
+  }
   async stopRecording() {
+    if (this.isTranscribing) {
+      await this.stopTranscription();
+    }
     if (this.recorder && this.recorder.state === "recording") {
       this.recorder.stop();
     }
@@ -965,10 +1372,22 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
     const extension = this.settings.outputFormat;
     const filename = `${folderPath}/Recording ${timestamp}.${extension}`;
     const file = await this.app.vault.createBinary(filename, buffer.buffer);
+    if (this.transcriptionText.trim()) {
+      const transcriptFilename = `${folderPath}/Recording ${timestamp} Transcript.md`;
+      const transcriptContent = this.transcriptionText.trim();
+      await this.app.vault.create(transcriptFilename, transcriptContent);
+    }
     if (this.activeFileAtStart) {
-      const linkText = `
+      let linkText = `
 ![[${file.path}]]
 `;
+      if (this.transcriptionText.trim()) {
+        linkText += `
+> [!info]- Transcript
+`;
+        linkText += `> ${this.transcriptionText.trim().replace(/\n/g, "\n> ")}
+`;
+      }
       await this.app.vault.append(this.activeFileAtStart, linkText);
     }
   }
@@ -996,6 +1415,35 @@ var AudioRecorderPlugin = class extends import_obsidian.Plugin {
       buf[l] = Math.min(1, Math.max(-1, buffer[l])) * 32767;
     }
     return buf;
+  }
+  createWavFile(audioData, targetSampleRate) {
+    const ratio = this.sampleRate / targetSampleRate;
+    const newLength = Math.round(audioData.length / ratio);
+    const resampled = new Float32Array(newLength);
+    for (let i = 0; i < newLength; i++) {
+      const srcIndex = i * ratio;
+      const srcIndexFloor = Math.floor(srcIndex);
+      const srcIndexCeil = Math.min(srcIndexFloor + 1, audioData.length - 1);
+      const t = srcIndex - srcIndexFloor;
+      resampled[i] = audioData[srcIndexFloor] * (1 - t) + audioData[srcIndexCeil] * t;
+    }
+    const buffer = new ArrayBuffer(44 + resampled.length * 2);
+    const view = new DataView(buffer);
+    this.writeString(view, 0, "RIFF");
+    view.setUint32(4, 36 + resampled.length * 2, true);
+    this.writeString(view, 8, "WAVE");
+    this.writeString(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, targetSampleRate, true);
+    view.setUint32(28, targetSampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    this.writeString(view, 36, "data");
+    view.setUint32(40, resampled.length * 2, true);
+    this.floatTo16BitPCM(view, 44, resampled);
+    return view;
   }
   writeWavHeader(samples) {
     const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -1070,6 +1518,144 @@ var AudioRecorderSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       });
     });
+    containerEl.createEl("h3", { text: "Live Transcription" });
+    new import_obsidian.Setting(containerEl).setName("Enable Live Transcription").setDesc(
+      "Enable live transcription during recording. Requires whisper.cpp to be installed locally."
+    ).addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.enableTranscription).onChange(async (value) => {
+        this.plugin.settings.enableTranscription = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    const fs = require("fs");
+    const path2 = require("path");
+    const os = require("os");
+    const executableDir = path2.join(
+      this.app.vault.adapter.getBasePath(),
+      ".obsidian",
+      "plugins",
+      this.plugin.manifest.id,
+      "bin"
+    );
+    const platform = os.platform();
+    let executableName = "main";
+    if (platform === "win32") {
+      executableName = "main.exe";
+    }
+    const executablePath = path2.join(executableDir, executableName);
+    const executableExists = fs.existsSync(executablePath);
+    const executableSetting = new import_obsidian.Setting(containerEl).setName("Whisper.cpp Executable").setDesc(
+      executableExists ? `Installed at: ${executablePath}` : "Not found. Click the button to download whisper.cpp automatically."
+    );
+    executableSetting.addButton((button) => {
+      button.setButtonText(
+        executableExists ? "Re-download" : "Download whisper.cpp"
+      ).setCta().onClick(async () => {
+        button.setDisabled(true);
+        button.setButtonText("Downloading...");
+        const statusDiv = containerEl.createDiv();
+        statusDiv.addClass("setting-item-description");
+        statusDiv.style.marginTop = "0.5em";
+        statusDiv.style.color = "#7c3aed";
+        statusDiv.setText("Detecting platform and downloading...");
+        try {
+          await this.downloadWhisperCpp((status) => {
+            statusDiv.setText(status);
+          });
+          statusDiv.style.color = "#10b981";
+          statusDiv.setText("Download complete!");
+          button.setButtonText("Re-download");
+          executableSetting.setDesc(`Installed at: ${executablePath}`);
+          this.plugin.settings.whisperCppPath = executablePath;
+          await this.plugin.saveSettings();
+          setTimeout(() => {
+            statusDiv.remove();
+          }, 3e3);
+        } catch (err) {
+          statusDiv.style.color = "#ef4444";
+          statusDiv.setText(`Error: ${err.message}`);
+          button.setButtonText(
+            executableExists ? "Re-download" : "Download whisper.cpp"
+          );
+        } finally {
+          button.setDisabled(false);
+        }
+      });
+    });
+    new import_obsidian.Setting(containerEl).setName("Whisper Model").setDesc(
+      "Select which model to use. Smaller models are faster but less accurate. English-only models (.en) are faster for English."
+    ).addDropdown((dropdown) => {
+      dropdown.addOption("tiny", "Tiny (~75MB) - Fastest, least accurate").addOption("tiny.en", "Tiny English (~75MB) - Fastest for English").addOption("base", "Base (~150MB) - Balanced").addOption("base.en", "Base English (~150MB) - Balanced for English").addOption("small", "Small (~500MB) - Good accuracy").addOption("small.en", "Small English (~500MB) - Good for English").addOption("medium", "Medium (~1.5GB) - High accuracy").addOption("medium.en", "Medium English (~1.5GB) - High for English").addOption("large-v1", "Large v1 (~3GB) - Best accuracy").addOption("large-v2", "Large v2 (~3GB) - Best accuracy").addOption("large-v3", "Large v3 (~3GB) - Best accuracy, latest").setValue(this.plugin.settings.whisperModel).onChange(async (value) => {
+        this.plugin.settings.whisperModel = value;
+        await this.plugin.saveSettings();
+        this.display();
+      });
+    });
+    const modelDir = path2.join(
+      this.app.vault.adapter.getBasePath(),
+      ".obsidian",
+      "plugins",
+      this.plugin.manifest.id,
+      "models"
+    );
+    const modelPath = path2.join(
+      modelDir,
+      `ggml-${this.plugin.settings.whisperModel}.bin`
+    );
+    const modelExists = fs.existsSync(modelPath);
+    const modelSetting = new import_obsidian.Setting(containerEl).setName("Whisper Model").setDesc(
+      modelExists ? `Model installed at: ${modelPath}` : "Model not found. Click the button to download (~150MB)."
+    );
+    modelSetting.addButton((button) => {
+      button.setButtonText(modelExists ? "Re-download Model" : "Download Model").setCta().onClick(async () => {
+        button.setDisabled(true);
+        button.setButtonText("Downloading...");
+        const statusDiv = containerEl.createDiv();
+        statusDiv.addClass("setting-item-description");
+        statusDiv.style.marginTop = "0.5em";
+        statusDiv.style.color = "#7c3aed";
+        statusDiv.setText("Starting download...");
+        try {
+          if (modelExists) {
+            try {
+              fs.unlinkSync(modelPath);
+            } catch (err) {
+              console.warn("Could not delete existing model:", err);
+            }
+          }
+          await this.downloadModelWithProgress((progress) => {
+            statusDiv.setText(`Downloading: ${progress}%`);
+          });
+          statusDiv.style.color = "#10b981";
+          statusDiv.setText("Download complete!");
+          button.setButtonText("Re-download Model");
+          modelSetting.setDesc(`Model installed at: ${modelPath}`);
+          setTimeout(() => {
+            statusDiv.remove();
+          }, 3e3);
+        } catch (err) {
+          statusDiv.style.color = "#ef4444";
+          statusDiv.setText(`Error: ${err.message}`);
+          button.setButtonText(
+            modelExists ? "Re-download Model" : "Download Model"
+          );
+        } finally {
+          button.setDisabled(false);
+        }
+      });
+    });
+    const instructionsDiv = containerEl.createDiv();
+    instructionsDiv.addClass("setting-item-description");
+    instructionsDiv.style.marginBottom = "1em";
+    instructionsDiv.style.padding = "0.5em";
+    instructionsDiv.style.backgroundColor = "var(--background-secondary)";
+    instructionsDiv.style.borderRadius = "4px";
+    instructionsDiv.innerHTML = `
+      <strong>\u{1F4DD} Setup Instructions:</strong><br>
+      1. Click "Download whisper.cpp" above<br>
+      2. Click "Download Model" below<br>
+      3. Enable transcription and start recording!
+    `;
     containerEl.createEl("h3", { text: "Hotkeys" });
     new import_obsidian.Setting(containerEl).setName("Global Mute Hotkey").setDesc(
       "Set a system-wide hotkey to toggle microphone muting (works even when Obsidian isn't focused). Uses Electron's accelerator format. Examples: 'CommandOrControl+Shift+M', 'Alt+M', 'Ctrl+Shift+Space'. Changes take effect when starting a new recording."
@@ -1085,5 +1671,367 @@ var AudioRecorderSettingTab = class extends import_obsidian.PluginSettingTab {
       "You can also use Obsidian's built-in hotkeys (Settings \u2192 Hotkeys \u2192 'Toggle Microphone Mute'), but those only work when Obsidian is focused."
     );
     hotkeyDesc.style.marginBottom = "1em";
+  }
+  async downloadWhisperCpp(statusCallback) {
+    const fs = require("fs");
+    const path2 = require("path");
+    const os = require("os");
+    const https = require("https");
+    const platform = os.platform();
+    const arch = os.arch();
+    const binDir = path2.join(
+      this.app.vault.adapter.getBasePath(),
+      ".obsidian",
+      "plugins",
+      this.plugin.manifest.id,
+      "bin"
+    );
+    if (!fs.existsSync(binDir)) {
+      fs.mkdirSync(binDir, { recursive: true });
+    }
+    let executableName = "main";
+    let downloadUrl = "";
+    if (platform === "win32") {
+      executableName = "main.exe";
+      if (arch === "x64") {
+        downloadUrl = "https://github.com/ggerganov/whisper.cpp/releases/download/v1.8.2/whisper-bin-x64.zip";
+      } else {
+        executableName = "main.exe";
+        downloadUrl = "https://github.com/ggerganov/whisper.cpp/releases/download/v1.8.2/whisper-bin-Win32.zip";
+      }
+    } else if (platform === "darwin") {
+      throw new Error(
+        "Automatic download not available for macOS. Please install via Homebrew: brew install whisper-cpp"
+      );
+    } else if (platform === "linux") {
+      throw new Error(
+        "Automatic download not available for Linux. Please build from source: https://github.com/ggerganov/whisper.cpp"
+      );
+    } else {
+      throw new Error(`Unsupported platform: ${platform}`);
+    }
+    const executablePath = path2.join(binDir, executableName);
+    statusCallback("Downloading whisper.cpp...");
+    return new Promise((resolve, reject) => {
+      const zipPath = path2.join(binDir, "whisper.zip");
+      const file = fs.createWriteStream(zipPath);
+      let downloadedBytes = 0;
+      let totalBytes = 0;
+      file.on("error", (err) => {
+        console.error("File write stream error:", err);
+        reject(err);
+      });
+      const followRedirects = (url, depth = 0) => {
+        if (depth > 10) {
+          reject(new Error("Too many redirects (>10)"));
+          return;
+        }
+        https.get(url, (response) => {
+          if (response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 303 || response.statusCode === 307 || response.statusCode === 308) {
+            const redirectUrl = response.headers.location;
+            response.resume();
+            followRedirects(redirectUrl, depth + 1);
+          } else if (response.statusCode === 200) {
+            totalBytes = parseInt(
+              response.headers["content-length"] || "0",
+              10
+            );
+            response.on("data", (chunk) => {
+              downloadedBytes += chunk.length;
+              const progress = Math.floor(
+                downloadedBytes / totalBytes * 100
+              );
+              statusCallback(`Downloading whisper.cpp: ${progress}%`);
+            });
+            response.on("error", (err) => {
+              console.error("Response stream error:", err);
+              file.close();
+              fs.unlink(zipPath, () => {
+              });
+              reject(err);
+            });
+            response.pipe(file);
+            file.on("finish", () => {
+              file.close(() => {
+                const stats = fs.statSync(zipPath);
+                if (stats.size === 0) {
+                  reject(new Error("Downloaded file is empty"));
+                  return;
+                }
+                if (stats.size < 1e3) {
+                  reject(
+                    new Error(
+                      "Downloaded file appears to be invalid or corrupted"
+                    )
+                  );
+                  return;
+                }
+                statusCallback("Extracting...");
+                try {
+                  const { execSync } = require("child_process");
+                  if (platform === "win32") {
+                    const zipPathPS = zipPath.replace(/\\/g, "/");
+                    const binDirPS = binDir.replace(/\\/g, "/");
+                    try {
+                      const command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${zipPathPS}', '${binDirPS}'); Write-Output 'Done'"`;
+                      execSync(command, {
+                        encoding: "utf8"
+                      });
+                    } catch (e) {
+                      try {
+                        const psCommand = `Expand-Archive -LiteralPath '${zipPath}' -DestinationPath '${binDir}' -Force`;
+                        execSync(
+                          `powershell -NoProfile -ExecutionPolicy Bypass -Command "${psCommand}"`,
+                          {
+                            encoding: "utf8"
+                          }
+                        );
+                      } catch (e2) {
+                        throw new Error(
+                          `Failed to extract archive: ${e2.message}`
+                        );
+                      }
+                    }
+                  } else {
+                    execSync(`unzip -o "${zipPath}" -d "${binDir}"`, {
+                      encoding: "utf8"
+                    });
+                  }
+                  let extractedFiles = fs.readdirSync(binDir);
+                  let found = false;
+                  if (extractedFiles.length === 1 && extractedFiles[0] === "whisper.zip") {
+                    console.error(
+                      "Extraction appears to have failed - only zip file present"
+                    );
+                    throw new Error(
+                      "Failed to extract whisper.cpp archive. The download may be corrupted or the archive format is unsupported."
+                    );
+                  }
+                  for (const extractedFile of extractedFiles) {
+                    if (extractedFile.endsWith(".zip") && extractedFile !== "whisper.zip") {
+                      const nestedZipPath = path2.join(binDir, extractedFile);
+                      const tempExtractDir = path2.join(
+                        binDir,
+                        "temp_extract"
+                      );
+                      if (!fs.existsSync(tempExtractDir)) {
+                        fs.mkdirSync(tempExtractDir, { recursive: true });
+                      }
+                      const nestedZipPathPS = nestedZipPath.replace(
+                        /\\/g,
+                        "/"
+                      );
+                      const tempExtractDirPS = tempExtractDir.replace(
+                        /\\/g,
+                        "/"
+                      );
+                      try {
+                        const command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${nestedZipPathPS}', '${tempExtractDirPS}'); Write-Output 'Done'"`;
+                        execSync(command, {
+                          encoding: "utf8"
+                        });
+                      } catch (e) {
+                        try {
+                          const psCommand2 = `Expand-Archive -LiteralPath '${nestedZipPath}' -DestinationPath '${tempExtractDir}' -Force`;
+                          execSync(
+                            `powershell -NoProfile -ExecutionPolicy Bypass -Command "${psCommand2}"`,
+                            {
+                              encoding: "utf8"
+                            }
+                          );
+                        } catch (e2) {
+                          throw new Error(
+                            `Failed to extract nested archive: ${e2.message}`
+                          );
+                        }
+                      }
+                      const tempFiles = fs.readdirSync(tempExtractDir);
+                      for (const tempFile of tempFiles) {
+                        const srcPath = path2.join(tempExtractDir, tempFile);
+                        const destPath = path2.join(binDir, tempFile);
+                        if (fs.existsSync(destPath)) {
+                          if (fs.statSync(destPath).isDirectory()) {
+                            fs.rmSync(destPath, { recursive: true });
+                          } else {
+                            fs.unlinkSync(destPath);
+                          }
+                        }
+                        fs.renameSync(srcPath, destPath);
+                      }
+                      fs.rmdirSync(tempExtractDir);
+                      fs.unlinkSync(nestedZipPath);
+                      extractedFiles = fs.readdirSync(binDir);
+                      break;
+                    }
+                  }
+                  for (const extractedFile of extractedFiles) {
+                    if (extractedFile === "main.exe" || extractedFile === "main" || extractedFile === "whisper.exe" || extractedFile === "whisper") {
+                      const extractedPath = path2.join(binDir, extractedFile);
+                      if (extractedPath !== executablePath) {
+                        fs.renameSync(extractedPath, executablePath);
+                      }
+                      found = true;
+                      break;
+                    }
+                  }
+                  if (!found) {
+                    for (const extractedFile of extractedFiles) {
+                      const fullPath = path2.join(binDir, extractedFile);
+                      try {
+                        if (fs.statSync(fullPath).isDirectory()) {
+                          const subFiles = fs.readdirSync(fullPath);
+                          const hasWhisperCli = subFiles.includes("whisper-cli.exe");
+                          const hasMainExe = subFiles.includes("main.exe");
+                          if (hasWhisperCli || hasMainExe) {
+                            for (const subFile of subFiles) {
+                              const srcPath = path2.join(fullPath, subFile);
+                              const destPath = path2.join(binDir, subFile);
+                              try {
+                                if (fs.statSync(srcPath).isFile()) {
+                                  fs.copyFileSync(srcPath, destPath);
+                                }
+                              } catch (copyErr) {
+                                console.error(
+                                  `Failed to copy ${subFile}:`,
+                                  copyErr.message
+                                );
+                              }
+                            }
+                            const preferredExe = hasWhisperCli ? "whisper-cli.exe" : "main.exe";
+                            const srcExe = path2.join(binDir, preferredExe);
+                            if (fs.existsSync(srcExe) && srcExe !== executablePath) {
+                              fs.renameSync(srcExe, executablePath);
+                            }
+                            try {
+                              fs.rmSync(fullPath, {
+                                recursive: true,
+                                force: true
+                              });
+                            } catch (cleanupErr) {
+                            }
+                            found = true;
+                            break;
+                          }
+                        }
+                      } catch (e) {
+                        console.error(
+                          `Error checking ${extractedFile}:`,
+                          e.message
+                        );
+                      }
+                    }
+                  }
+                  if (platform !== "win32") {
+                    fs.chmodSync(executablePath, 493);
+                  }
+                  try {
+                    fs.unlinkSync(zipPath);
+                  } catch (e) {
+                  }
+                  if (found) {
+                    resolve(executablePath);
+                  } else {
+                    reject(
+                      new Error(
+                        "Could not find main executable in downloaded archive"
+                      )
+                    );
+                  }
+                } catch (err) {
+                  reject(err);
+                }
+              });
+            });
+          } else {
+            console.error(
+              `[Depth ${depth}] Unexpected status: ${response.statusCode}`
+            );
+            reject(
+              new Error(
+                `Download failed with status: ${response.statusCode}`
+              )
+            );
+          }
+        }).on("error", (err) => {
+          console.error(`[Depth ${depth}] Request error:`, err);
+          fs.unlink(zipPath, () => {
+          });
+          reject(err);
+        });
+      };
+      followRedirects(downloadUrl);
+    });
+  }
+  async downloadModelWithProgress(progressCallback) {
+    const fs = require("fs");
+    const path2 = require("path");
+    const https = require("https");
+    const modelDir = path2.join(
+      this.app.vault.adapter.getBasePath(),
+      ".obsidian",
+      "plugins",
+      this.plugin.manifest.id,
+      "models"
+    );
+    if (!fs.existsSync(modelDir)) {
+      fs.mkdirSync(modelDir, { recursive: true });
+    }
+    const modelName = `ggml-${this.plugin.settings.whisperModel}.bin`;
+    const modelPath = path2.join(modelDir, modelName);
+    const modelUrl = `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${modelName}`;
+    return new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(modelPath);
+      let downloadedBytes = 0;
+      let totalBytes = 0;
+      let lastReportedProgress = 0;
+      https.get(modelUrl, (response) => {
+        if (response.statusCode === 302 || response.statusCode === 301) {
+          https.get(response.headers.location, (redirectResponse) => {
+            totalBytes = parseInt(
+              redirectResponse.headers["content-length"],
+              10
+            );
+            redirectResponse.on("data", (chunk) => {
+              downloadedBytes += chunk.length;
+              const progress = Math.floor(
+                downloadedBytes / totalBytes * 100
+              );
+              if (progress > lastReportedProgress) {
+                lastReportedProgress = progress;
+                progressCallback(progress.toString());
+              }
+            });
+            redirectResponse.pipe(file);
+            file.on("finish", () => {
+              file.close();
+              resolve(modelPath);
+            });
+          }).on("error", (err) => {
+            fs.unlink(modelPath, () => {
+            });
+            reject(err);
+          });
+        } else {
+          totalBytes = parseInt(response.headers["content-length"], 10);
+          response.on("data", (chunk) => {
+            downloadedBytes += chunk.length;
+            const progress = Math.floor(downloadedBytes / totalBytes * 100);
+            if (progress > lastReportedProgress) {
+              lastReportedProgress = progress;
+              progressCallback(progress.toString());
+            }
+          });
+          response.pipe(file);
+          file.on("finish", () => {
+            file.close();
+            resolve(modelPath);
+          });
+        }
+      }).on("error", (err) => {
+        fs.unlink(modelPath, () => {
+        });
+        reject(err);
+      });
+    });
   }
 };
